@@ -23,6 +23,7 @@ func newModel(db *sql.DB) model {
 		{Title: "ID", Width: 26},
 		{Title: "Key", Width: 5},
 		{Title: "Created", Width: 19},
+		{Title: "Inserted", Width: 19},
 	}
 	t := table.New(
 		table.WithColumns(columns),
@@ -52,7 +53,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *model) refresh() {
-	rows, err := m.db.Query("SELECT id, key, created_at FROM messages ORDER BY created_at DESC LIMIT 20")
+	rows, err := m.db.Query("SELECT id, key, created_at, inserted_at FROM messages ORDER BY inserted_at DESC LIMIT 20")
 	if err != nil {
 		log.Printf("query: %v", err)
 		return
@@ -61,12 +62,12 @@ func (m *model) refresh() {
 	var data []table.Row
 	for rows.Next() {
 		var id, key string
-		var created time.Time
-		if err := rows.Scan(&id, &key, &created); err != nil {
+		var created, inserted time.Time
+		if err := rows.Scan(&id, &key, &created, &inserted); err != nil {
 			log.Printf("scan: %v", err)
 			continue
 		}
-		data = append(data, table.Row{id, key, created.Format(time.RFC3339)})
+		data = append(data, table.Row{id, key, created.Format(time.RFC3339), inserted.Format(time.RFC3339)})
 	}
 	m.table.SetRows(data)
 }
@@ -82,7 +83,7 @@ func main() {
 		log.Fatal(err)
 	}
 	defer db.Close()
-	if _, err := db.Exec("CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY, key TEXT, created_at TIMESTAMP)"); err != nil {
+	if _, err := db.Exec("CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY, key TEXT, created_at TIMESTAMP, inserted_at TIMESTAMP)"); err != nil {
 		log.Fatalf("creating table: %v", err)
 	}
 

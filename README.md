@@ -7,13 +7,16 @@ viewed in a Bubble Tea table.
 
 ## Running
 
-In one terminal, start the publisher and workers:
+In one terminal, start the publisher and workers. Batching parameters can be
+configured via flags:
 
 ```
-go run ./cmd/pubsub
+go run ./cmd/pubsub -batch 10 -flush 1s -workers 2
 ```
 
-Press keys to enqueue messages. Press ESC or Ctrl+C to exit.
+Press keys to enqueue messages. Press ESC or Ctrl+C to exit. Messages include
+their creation time and are saved with an additional inserted timestamp when
+workers flush batches to the database.
 
 In another terminal, view the stored messages:
 
@@ -21,7 +24,8 @@ In another terminal, view the stored messages:
 go run ./cmd/viewer
 ```
 
-The viewer refreshes every second and shows the most recent rows.
+The viewer refreshes every second and shows the most recent rows with both
+message creation and insertion timestamps.
 
 ## Dependencies
 
