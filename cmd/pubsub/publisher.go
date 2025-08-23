@@ -151,18 +151,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	// FrameMsg is sent when the progress bar wants to animate itself
 	// ie. from progress.IncrPercent
+	// https://github.com/charmbracelet/bubbletea/blob/b7042c77daa46ef7719dbd5419c32da8a4ce18ba/examples/progress-animated/main.go#L49
 	case progress.FrameMsg:
-		model2, cmd2 := m.flushProgress.Update(msg)
-		if cmd2 != nil {
-			p := model2.(progress.Model)
-			m.flushProgress = p
-		}
+		// m               -> model
+		// m.flushProgress -> progress.Model
+		// m.batchProgress -> progress.Model
 
 		model1, cmd1 := m.batchProgress.Update(msg)
-		if cmd1 != nil {
-			p := model1.(progress.Model)
-			m.batchProgress = p
-		}
+		m.batchProgress = model1.(progress.Model)
+
+		model2, cmd2 := m.flushProgress.Update(msg)
+		m.flushProgress = model2.(progress.Model)
 
 		return m, tea.Batch(cmd1, cmd2)
 
@@ -275,8 +274,10 @@ func main() {
 	const maxDelaySeconds = 5
 	const maxDelay = time.Duration(maxDelaySeconds) * time.Second
 
-	const ackRate = 0
-	const nackRate = 0
+	// a random number greater than or equal to this value to result in an ACK
+	const ackThreshold = 0.5
+	// a random number greater than or equal to this value to result in a NACK
+	const nackThreshold = 0.2
 
 	publisher := pubSubClient.Publisher(topicFullName)
 	subscriber := pubSubClient.Subscriber(subscriptionFullName)
@@ -289,14 +290,14 @@ func main() {
 	ch := newClickHouseConnection()
 	defer ch.Close()
 
-	sqlite := NewSqlLiteDatastore()
-	if err := sqlite.InitTable(db); err != nil {
+	sqlite := NewSqlLiteDatastore(db)
+	if err := sqlite.InitTable(ctx); err != nil {
 		log.Fatalf("initializing sqlite table: %v", err)
 	}
 
 	// ClickHouse
-	clickhouse := NewClickHouseDatastore()
-	if err := clickhouse.InitTable(ctx, ch); err != nil {
+	clickhouse := NewClickHouseDatastore(ch)
+	if err := clickhouse.InitTable(ctx); err != nil {
 		log.Fatalf("initializing clickhouse table: %v", err)
 	}
 
@@ -337,52 +338,37 @@ func main() {
 			noResCount := 0
 			batchSize := len(batch)
 
-			placeholders := make([]string, 0, len(batch))
-			args := make([]interface{}, 0, len(batch)*4)
+			// Build records for batch insert
+			records := make([]MessageRecord, 0, len(batch))
 			for _, msg := range batch {
-				placeholders = append(placeholders, "(?, ?, ?, ?)")
-				args = append(args,
-					msg.ID,
-					string(msg.Data),
-					msg.PublishTime.UTC(),
-					time.Now().UTC(),
-				)
+				records = append(records, MessageRecord{
+					ID:         msg.ID,
+					Key:        string(msg.Data),
+					CreatedAt:  msg.PublishTime.UTC(),
+					InsertedAt: time.Now().UTC(),
+				})
 			}
-			stmt := fmt.Sprintf("INSERT INTO messages (id, key, created_at, inserted_at) VALUES %s",
-				strings.Join(placeholders, ","))
-			tx, err := db.Begin()
-			if err != nil {
-				log.Println("begin tx error:", err)
+
+			// Try sqlite first; on error, nack all
+			if err := sqlite.Batch(context.Background(), records); err != nil {
+				log.Println("sqlite batch error:", err)
 				for _, m := range batch {
 					nackCount++
 					m.Nack()
 				}
 			} else {
-				if _, err := tx.Exec(stmt, args...); err != nil {
-					_ = tx.Rollback()
-					// log.Println("insert batch error:", err)
-					for _, m := range batch {
-						nackCount++
-						m.Nack()
-					}
-				} else {
-					if err := tx.Commit(); err != nil {
-						log.Println("commit error:", err)
-						for _, m := range batch {
-							nackCount++
-							m.Nack()
-						}
-					}
-					// on successful commit, fall through to ack/nack simulation below
+				// Also try clickhouse, but do not nack on clickhouse error; just log
+				if err := clickhouse.Batch(context.Background(), records); err != nil {
+					log.Println("clickhouse batch error:", err)
 				}
 			}
 
 			// simulate some fake success and failure to cause msgs to be redelivered
 			for _, m := range batch {
-				if rand.Float32() >= ackRate {
+				if rand.Float32() >= ackThreshold {
 					ackCount++
 					m.Ack()
-				} else if rand.Float32() > nackRate {
+				} else if rand.Float32() > nackThreshold {
 					nackCount++
 					m.Nack()
 				}
@@ -497,22 +483,60 @@ func newSqlLiteConnection() *sql.DB {
 	return db
 }
 
-// Should be a new file
+// MessageRecord is the shared row type used by datastores for batch inserts.
+type MessageRecord struct {
+	ID         string
+	Key        string
+	CreatedAt  time.Time
+	InsertedAt time.Time
+}
+
+// SqlLiteDatastore holds a sqlite connection and implements Batch.
 type SqlLiteDatastore struct {
+	db *sql.DB
 }
 
-func NewSqlLiteDatastore() *SqlLiteDatastore {
-	return &SqlLiteDatastore{}
+func NewSqlLiteDatastore(db *sql.DB) *SqlLiteDatastore {
+	return &SqlLiteDatastore{db: db}
 }
 
-func (ds *SqlLiteDatastore) InitTable(db *sql.DB) error {
-	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS messages(
+// InitTable ensures the messages table exists.
+func (ds *SqlLiteDatastore) InitTable(ctx context.Context) error {
+	if _, err := ds.db.Exec(`CREATE TABLE IF NOT EXISTS messages(
 		id TEXT, 
 		key TEXT, 
 		created_at TIMESTAMP, 
 		inserted_at TIMESTAMP)
 	`); err != nil {
-		log.Fatalf("creating table: %v", err)
+		return fmt.Errorf("creating table: %w", err)
+	}
+	return nil
+}
+
+// Batch inserts multiple records into sqlite in a single transaction.
+func (ds *SqlLiteDatastore) Batch(ctx context.Context, rows []MessageRecord) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	placeholders := make([]string, 0, len(rows))
+	args := make([]interface{}, 0, len(rows)*4)
+	for _, r := range rows {
+		placeholders = append(placeholders, "(?, ?, ?, ?)")
+		args = append(args, r.ID, r.Key, r.CreatedAt.UTC(), r.InsertedAt.UTC())
+	}
+	stmt := fmt.Sprintf("INSERT INTO messages (id, key, created_at, inserted_at) VALUES %s",
+		strings.Join(placeholders, ","))
+
+	tx, err := ds.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	if _, err := tx.Exec(stmt, args...); err != nil {
+		_ = tx.Rollback()
+		return fmt.Errorf("exec insert: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit: %w", err)
 	}
 	return nil
 }
@@ -533,14 +557,15 @@ func newClickHouseConnection() driver.Conn {
 }
 
 type ClickHouseDatastore struct {
+	conn driver.Conn
 }
 
-func NewClickHouseDatastore() *ClickHouseDatastore {
-	return &ClickHouseDatastore{}
+func NewClickHouseDatastore(conn driver.Conn) *ClickHouseDatastore {
+	return &ClickHouseDatastore{conn: conn}
 }
 
-func (ds *ClickHouseDatastore) InitTable(ctx context.Context, conn driver.Conn) error {
-	err := conn.Exec(ctx, `CREATE TABLE IF NOT EXISTS messages(
+func (ds *ClickHouseDatastore) InitTable(ctx context.Context) error {
+	err := ds.conn.Exec(ctx, `CREATE TABLE IF NOT EXISTS messages(
 		id String, 
 		key String, 
 		created_at DateTime, 
@@ -549,4 +574,24 @@ func (ds *ClickHouseDatastore) InitTable(ctx context.Context, conn driver.Conn) 
 	ORDER BY id
 	`)
 	return err
+}
+
+// Batch inserts multiple records into ClickHouse using PrepareBatch API.
+func (ds *ClickHouseDatastore) Batch(ctx context.Context, rows []MessageRecord) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	batch, err := ds.conn.PrepareBatch(ctx, "INSERT INTO messages (id, key, created_at, inserted_at)")
+	if err != nil {
+		return fmt.Errorf("prepare batch: %w", err)
+	}
+	for _, r := range rows {
+		if err := batch.Append(r.ID, r.Key, r.CreatedAt.UTC(), r.InsertedAt.UTC()); err != nil {
+			return fmt.Errorf("append batch: %w", err)
+		}
+	}
+	if err := batch.Send(); err != nil {
+		return fmt.Errorf("send batch: %w", err)
+	}
+	return nil
 }

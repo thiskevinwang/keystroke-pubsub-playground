@@ -5,7 +5,7 @@
 In 3 terminals:
 
 ```console
-user@~: $ gcloud beta emulators pubsub start --project=local
+user@~: $ docker compose up
 ```
 
 ```console

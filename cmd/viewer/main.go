@@ -10,6 +10,7 @@ import (
 	"github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
 	"github.com/charmbracelet/bubbles/table"
+	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	_ "modernc.org/sqlite"
@@ -18,21 +19,30 @@ import (
 type tickMsg time.Time
 
 type model struct {
-	table table.Model
-	db    *sql.DB
-	ch    driver.Conn
+	idInput string
+
+	textInput textinput.Model
+	table     table.Model
+	db        *sql.DB
+	ch        driver.Conn
 }
 
 func newModel(db *sql.DB, ch driver.Conn) model {
+	ti := textinput.New()
+	ti.Placeholder = "..."
+	ti.Width = 20
+	ti.Focus()
+
 	columns := []table.Column{
+		{Title: " ", Width: 3},
 		{Title: "ID", Width: 5},
 		{Title: "Key", Width: 5},
-		{Title: "Published", Width: 25},
-		{Title: "Inserted (DESC)", Width: 25},
-		{Title: "Diff", Width: 19},
+		{Title: "Published Ago", Width: 30},
+		{Title: "Inserted Ago (DESC)", Width: 30},
 	}
 	t := table.New(
 		table.WithColumns(columns),
+		table.WithFocused(false),
 	)
 	s := table.DefaultStyles()
 	s.Header = s.Header.
@@ -40,38 +50,63 @@ func newModel(db *sql.DB, ch driver.Conn) model {
 		BorderForeground(lipgloss.Color("240")).
 		BorderBottom(true).
 		Bold(false)
-	s.Selected = s.Selected.
-		Foreground(lipgloss.Color("229")).
-		Background(lipgloss.Color("57")).
-		Bold(false)
+
 	t.SetStyles(s)
+
 	return model{
-		table: t,
-		db:    db,
-		ch:    ch}
+		textInput: ti,
+		table:     t,
+		db:        db,
+		ch:        ch}
 }
 
+// MARK: Init
 func (m model) Init() tea.Cmd {
 	return tea.Tick(time.Second, func(t time.Time) tea.Msg { return tickMsg(t) })
 }
 
+// MARK: Update
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	var cmd tea.Cmd
 	switch msg := msg.(type) {
 	case tickMsg:
 		m.refresh()
 		return m, tea.Tick(time.Second, func(t time.Time) tea.Msg { return tickMsg(t) })
 	case tea.KeyMsg:
-		if msg.String() == "q" || msg.String() == "ctrl+c" {
+		switch msg.String() {
+		case "ctrl+c", "q":
 			return m, tea.Quit
+		default:
+			var tiCmd tea.Cmd
+
+			m.textInput, tiCmd = m.textInput.Update(msg)
+			m.idInput = m.textInput.Value()
+
+			// highlight rows whose ID matches the input
+			rows := m.table.Rows()
+			for i := range rows {
+				if rows[i][1] == m.idInput {
+					rows[i][0] = "->"
+				}
+			}
+			m.table.SetRows(rows)
+
+			return m, tea.Batch(tiCmd)
 		}
 	}
-	var cmd tea.Cmd
+
 	m.table, cmd = m.table.Update(msg)
 	return m, cmd
 }
 
 func (m *model) refresh() {
-	rows, err := m.ch.Query(context.Background(), "SELECT id, key, created_at, inserted_at FROM messages ORDER BY inserted_at DESC LIMIT 20")
+	rows, err := m.ch.Query(context.Background(), `SELECT
+	id, key,
+	formatReadableTimeDelta(timeDiff(created_at, now64())), 
+	formatReadableTimeDelta(timeDiff(inserted_at, now64()))
+	FROM messages
+	ORDER BY inserted_at DESC
+	LIMIT 20`)
 	if err != nil {
 		log.Printf("query: %v", err)
 		return
@@ -80,23 +115,31 @@ func (m *model) refresh() {
 	var data []table.Row
 	for rows.Next() {
 		var id, key string
-		var created, inserted time.Time
+		var created, inserted string
+
 		if err := rows.Scan(&id, &key, &created, &inserted); err != nil {
 			log.Printf("scan: %v", err)
 			continue
 		}
+
+		// if id matches input,
+		matcher := ""
+		if id == m.idInput {
+			matcher = "->"
+		}
+
 		data = append(data, table.Row{
+			matcher,
 			id, key,
-			created.Format(time.RFC3339), inserted.Format(time.RFC3339),
-			inserted.Sub(created).String(),
+			created, inserted,
 		})
 	}
 	m.table.SetRows(data)
 }
 
+// MARK: View
 func (m model) View() string {
-	s := lipgloss.NewStyle().Margin(1, 2)
-	return s.Render(m.table.View()) + "\nPress q to quit\n"
+	return "Highlight an ID: " + m.textInput.View() + "\n\n" + m.table.View() + "\nPress q to quit\n"
 }
 
 func main() {
