@@ -1,0 +1,29 @@
+services:
+  pubsub-emulator:
+    image: gcr.io/google.com/cloudsdktool/google-cloud-cli:latest
+    container_name: pubsub-emulator
+    # Start the gcloud pubsub emulator and bind to all interfaces so host can reach it
+    command: >
+      bash -lc "gcloud components install pubsub-emulator -q || true && \
+      gcloud beta emulators pubsub start --host-port=0.0.0.0:8085 --project=local-project"
+    ports:
+      - "8085:8085"
+    environment:
+      # convenience var for clients; configure your app to use this when running locally
+      - PUBSUB_EMULATOR_HOST=pubsub-emulator:8085
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.6
+    container_name: clickhouse
+    # ClickHouse default HTTP port (8123) and native TCP (9000) are published to the host
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    environment:
+      - CLICKHOUSE_USER=default
+      - CLICKHOUSE_PASSWORD=123456
+      - CLICKHOUSE_DATABASE=default 
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144

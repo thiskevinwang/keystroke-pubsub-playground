@@ -1,10 +1,14 @@
 package main
 
 import (
+	"context"
 	"database/sql"
+
 	"log"
 	"time"
 
+	"github.com/ClickHouse/clickhouse-go/v2"
+	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
 	"github.com/charmbracelet/bubbles/table"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -16,9 +20,10 @@ type tickMsg time.Time
 type model struct {
 	table table.Model
 	db    *sql.DB
+	ch    driver.Conn
 }
 
-func newModel(db *sql.DB) model {
+func newModel(db *sql.DB, ch driver.Conn) model {
 	columns := []table.Column{
 		{Title: "ID", Width: 5},
 		{Title: "Key", Width: 5},
@@ -40,7 +45,10 @@ func newModel(db *sql.DB) model {
 		Background(lipgloss.Color("57")).
 		Bold(false)
 	t.SetStyles(s)
-	return model{table: t, db: db}
+	return model{
+		table: t,
+		db:    db,
+		ch:    ch}
 }
 
 func (m model) Init() tea.Cmd {
@@ -63,7 +71,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *model) refresh() {
-	rows, err := m.db.Query("SELECT id, key, created_at, inserted_at FROM messages ORDER BY inserted_at DESC LIMIT 20")
+	rows, err := m.ch.Query(context.Background(), "SELECT id, key, created_at, inserted_at FROM messages ORDER BY inserted_at DESC LIMIT 20")
 	if err != nil {
 		log.Printf("query: %v", err)
 		return
@@ -92,14 +100,37 @@ func (m model) View() string {
 }
 
 func main() {
+	db := newSqlLiteConnection()
+	defer db.Close()
+
+	ch := newClickHouseConnection()
+	defer ch.Close()
+
+	m := newModel(db, ch)
+	if err := tea.NewProgram(m).Start(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func newSqlLiteConnection() *sql.DB {
 	db, err := sql.Open("sqlite", "file:messages.db?_pragma=journal_mode(WAL)&cache=shared")
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer db.Close()
+	return db
+}
 
-	m := newModel(db)
-	if err := tea.NewProgram(m).Start(); err != nil {
+func newClickHouseConnection() driver.Conn {
+	conn, err := clickhouse.Open(&clickhouse.Options{
+		Addr: []string{"localhost:9000"},
+		Auth: clickhouse.Auth{
+			Database: "default",
+			Username: "default",
+			Password: "123456",
+		},
+	})
+	if err != nil {
 		log.Fatal(err)
 	}
+	return conn
 }

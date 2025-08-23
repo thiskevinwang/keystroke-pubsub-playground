@@ -15,6 +15,8 @@ import (
 	"google.golang.org/grpc/codes"
 	_ "modernc.org/sqlite"
 
+	"github.com/ClickHouse/clickhouse-go/v2"
+	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
 	"github.com/charmbracelet/bubbles/progress"
 	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
@@ -269,7 +271,7 @@ func main() {
 	}
 
 	const maxGoRoutines = 10
-	const maxBatch = 1000
+	const maxBatch = 100
 	const maxDelaySeconds = 5
 	const maxDelay = time.Duration(maxDelaySeconds) * time.Second
 
@@ -282,18 +284,20 @@ func main() {
 	subscriber.ReceiveSettings.MaxOutstandingMessages = -1
 	subscriber.ReceiveSettings.MaxExtension = -1
 
-	db, err := sql.Open("sqlite", "file:messages.db?_pragma=journal_mode(WAL)&cache=shared")
-	if err != nil {
-		log.Fatal(err)
-	}
+	db := newSqlLiteConnection()
 	defer db.Close()
-	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS messages(
-		id TEXT, 
-		key TEXT, 
-		created_at TIMESTAMP, 
-		inserted_at TIMESTAMP)
-	`); err != nil {
-		log.Fatalf("creating table: %v", err)
+	ch := newClickHouseConnection()
+	defer ch.Close()
+
+	sqlite := NewSqlLiteDatastore()
+	if err := sqlite.InitTable(db); err != nil {
+		log.Fatalf("initializing sqlite table: %v", err)
+	}
+
+	// ClickHouse
+	clickhouse := NewClickHouseDatastore()
+	if err := clickhouse.InitTable(ctx, ch); err != nil {
+		log.Fatalf("initializing clickhouse table: %v", err)
 	}
 
 	// Bubble Tea program
@@ -483,4 +487,66 @@ func main() {
 		fmt.Println("could not start program:", err)
 		os.Exit(1)
 	}
+}
+
+func newSqlLiteConnection() *sql.DB {
+	db, err := sql.Open("sqlite", "file:messages.db?_pragma=journal_mode(WAL)&cache=shared")
+	if err != nil {
+		log.Fatal(err)
+	}
+	return db
+}
+
+// Should be a new file
+type SqlLiteDatastore struct {
+}
+
+func NewSqlLiteDatastore() *SqlLiteDatastore {
+	return &SqlLiteDatastore{}
+}
+
+func (ds *SqlLiteDatastore) InitTable(db *sql.DB) error {
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS messages(
+		id TEXT, 
+		key TEXT, 
+		created_at TIMESTAMP, 
+		inserted_at TIMESTAMP)
+	`); err != nil {
+		log.Fatalf("creating table: %v", err)
+	}
+	return nil
+}
+
+func newClickHouseConnection() driver.Conn {
+	conn, err := clickhouse.Open(&clickhouse.Options{
+		Addr: []string{"localhost:9000"},
+		Auth: clickhouse.Auth{
+			Database: "default",
+			Username: "default",
+			Password: "123456",
+		},
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	return conn
+}
+
+type ClickHouseDatastore struct {
+}
+
+func NewClickHouseDatastore() *ClickHouseDatastore {
+	return &ClickHouseDatastore{}
+}
+
+func (ds *ClickHouseDatastore) InitTable(ctx context.Context, conn driver.Conn) error {
+	err := conn.Exec(ctx, `CREATE TABLE IF NOT EXISTS messages(
+		id String, 
+		key String, 
+		created_at DateTime, 
+		inserted_at DateTime
+	) ENGINE = ReplacingMergeTree()
+	ORDER BY id
+	`)
+	return err
 }
